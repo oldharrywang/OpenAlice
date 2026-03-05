@@ -54,8 +54,8 @@ interface CcxtMarket {
   precision?: { price?: number; amount?: number }
 }
 
-const MAX_INIT_RETRIES = 5
-const INIT_RETRY_BASE_MS = 2000
+const MAX_INIT_RETRIES = 8
+const INIT_RETRY_BASE_MS = 500
 
 // ==================== CcxtAccount ====================
 
@@ -87,11 +87,18 @@ export class CcxtAccount implements ITradingAccount {
       throw new Error(`Unknown CCXT exchange: ${config.exchange}`)
     }
 
+    // Default: skip option markets to reduce concurrent requests during loadMarkets
+    // (bybit fires 6 parallel requests by default, which is unreliable through proxies)
+    const defaultOptions: Record<string, unknown> = {
+      fetchMarkets: { types: ['spot', 'linear', 'inverse'] },
+    }
+    const mergedOptions = { ...defaultOptions, ...config.options }
+
     this.exchange = new ExchangeClass({
       apiKey: config.apiKey,
       secret: config.apiSecret,
       password: config.password,
-      ...(config.options ? { options: config.options } : {}),
+      options: mergedOptions,
     })
 
     if (config.sandbox) {
@@ -106,32 +113,54 @@ export class CcxtAccount implements ITradingAccount {
   // ---- Lifecycle ----
 
   async init(): Promise<void> {
-    let lastError: Error | null = null
+    // CCXT's fetchMarkets fires all market-type requests via Promise.all —
+    // a single failure kills the entire batch. Monkey-patch fetchMarkets to
+    // run each type sequentially with per-type retries.
+    const origFetchMarkets = this.exchange.fetchMarkets.bind(this.exchange)
+    const accountId = this.id
 
-    for (let attempt = 1; attempt <= MAX_INIT_RETRIES; attempt++) {
-      try {
-        await this.exchange.loadMarkets()
-        this.initialized = true
+    this.exchange.fetchMarkets = async (params?: Record<string, unknown>) => {
+      const ex = this.exchange as unknown as Record<string, unknown>
+      const opts = (ex['options'] ?? {}) as Record<string, unknown>
+      const fmOpts = (opts['fetchMarkets'] ?? {}) as Record<string, unknown>
+      const types = (fmOpts['types'] ?? ['spot', 'linear', 'inverse']) as string[]
 
-        const marketCount = Object.keys(this.exchange.markets).length
-        const mode = this.readOnly ? ', read-only (no API keys)' : ''
-        console.log(
-          `CcxtAccount[${this.id}]: connected (${this.exchangeName}, ${marketCount} markets loaded${mode})`,
-        )
-        return
-      } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err))
-        if (attempt < MAX_INIT_RETRIES) {
-          const delay = INIT_RETRY_BASE_MS * Math.pow(2, attempt - 1)
-          console.warn(
-            `CcxtAccount[${this.id}]: loadMarkets attempt ${attempt}/${MAX_INIT_RETRIES} failed, retrying in ${delay}ms...`,
-          )
-          await new Promise(r => setTimeout(r, delay))
+      const allMarkets: unknown[] = []
+      for (const type of types) {
+        for (let attempt = 1; attempt <= MAX_INIT_RETRIES; attempt++) {
+          try {
+            // Temporarily override types to load a single type
+            const prevTypes = fmOpts['types']
+            fmOpts['types'] = [type]
+            const markets = await origFetchMarkets(params)
+            fmOpts['types'] = prevTypes
+            allMarkets.push(...markets)
+            break
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err)
+            if (attempt < MAX_INIT_RETRIES) {
+              const delay = INIT_RETRY_BASE_MS * Math.pow(2, attempt - 1)
+              console.warn(`CcxtAccount[${accountId}]: fetchMarkets(${type}) attempt ${attempt}/${MAX_INIT_RETRIES} failed, retrying in ${delay}ms...`)
+              await new Promise(r => setTimeout(r, delay))
+            } else {
+              console.warn(`CcxtAccount[${accountId}]: fetchMarkets(${type}) failed after ${MAX_INIT_RETRIES} attempts: ${msg} — skipping`)
+            }
+          }
         }
       }
+      return allMarkets as Awaited<ReturnType<Exchange['fetchMarkets']>>
     }
 
-    throw new Error(`CcxtAccount[${this.id}]: failed to initialize after ${MAX_INIT_RETRIES} attempts: ${lastError?.message}`)
+    // Now loadMarkets will use our sequential fetchMarkets
+    await this.exchange.loadMarkets()
+
+    const marketCount = Object.keys(this.exchange.markets).length
+    if (marketCount === 0) {
+      throw new Error(`CcxtAccount[${this.id}]: failed to load any markets`)
+    }
+    this.initialized = true
+    const mode = this.readOnly ? ', read-only (no API keys)' : ''
+    console.log(`CcxtAccount[${this.id}]: connected (${this.exchangeName}, ${marketCount} markets loaded${mode})`)
   }
 
   async close(): Promise<void> {
